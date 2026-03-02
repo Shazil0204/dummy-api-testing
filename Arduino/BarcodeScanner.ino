@@ -64,6 +64,16 @@ void setup() {
 
 void loop() {
   Usb.Task();
+  
+  // Periodic WiFi check every 30 seconds
+  static unsigned long lastWifiCheck = 0;
+  if (millis() - lastWifiCheck > 30000) {
+    lastWifiCheck = millis();
+    if (WiFi.status() != WL_CONNECTED) {
+      Serial.println("WiFi disconnected");
+    }
+  }
+  
   if (count > 0 && millis() - lastScan > TIMEOUT_MS) { beepError(); reset(); printList(); lastScan = millis(); }
   if (ready) {
     process(barcode);
@@ -107,7 +117,24 @@ void printList() {
 }
 
 bool httpRequest(String method, String url, String body = "") {
-  if (!client.connect(serverIP, serverPort)) return false;
+  // Check WiFi and reconnect if needed
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("WiFi lost, reconnecting...");
+    WiFi.disconnect();
+    delay(100);
+    status = WL_IDLE_STATUS;
+    while (status != WL_CONNECTED) { status = WiFi.begin(ssid, pass); delay(3000); }
+    Serial.print("Reconnected IP: "); Serial.println(WiFi.localIP());
+  }
+  
+  // Make sure previous connection is closed
+  client.stop();
+  delay(10);
+  
+  if (!client.connect(serverIP, serverPort)) {
+    Serial.println("Connect failed");
+    return false;
+  }
   
   client.print(method + " " + url + " HTTP/1.1\r\n");
   client.print("Host: " + String(serverIP) + ":" + serverPort + "\r\n");
@@ -117,16 +144,48 @@ bool httpRequest(String method, String url, String body = "") {
   }
   client.print("Connection: close\r\n\r\n");
   if (body.length() > 0) client.print(body);
+  client.flush();
   
+  // Wait for response with USB task running
   unsigned long t = millis();
-  while (!client.available()) { if (millis() - t > 10000) { client.stop(); return false; } }
+  while (!client.available()) {
+    Usb.Task(); // Keep USB alive
+    if (millis() - t > 5000) { client.stop(); return false; }
+    delay(10);
+  }
   
-  String resp = "";
-  while (client.available()) resp += (char)client.read();
+  // Read just enough to find "true" - don't store entire response
+  bool foundTrue = false;
+  bool inBody = false;
+  int crlfCount = 0;
+  
+  t = millis();
+  while (client.connected() || client.available()) {
+    if (millis() - t > 3000) break;
+    Usb.Task();
+    while (client.available()) {
+      char c = client.read();
+      if (!inBody) {
+        if (c == '\r' || c == '\n') crlfCount++;
+        else crlfCount = 0;
+        if (crlfCount >= 4) inBody = true;
+      } else {
+        if (c == 't' || c == 'T') {
+          // Check for "true"
+          String check = "t";
+          for (int i = 0; i < 3 && client.available(); i++) {
+            check += (char)client.read();
+          }
+          check.toLowerCase();
+          if (check == "true") foundTrue = true;
+        }
+      }
+    }
+    delay(1);
+  }
+  
   client.stop();
-  
-  int i = resp.indexOf("\r\n\r\n");
-  return (i >= 0 && resp.substring(i + 4).indexOf("true") >= 0);
+  return foundTrue;
 }
 
 bool validate(String b) { return httpRequest("GET", "/api/Asset/validate/" + b); }
