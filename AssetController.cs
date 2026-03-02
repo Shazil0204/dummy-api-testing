@@ -12,9 +12,9 @@ namespace dummy_api_testing
     [Route("api/[controller]")]
     public class AssetController : ControllerBase
     {
-        private static readonly List<string> _dummyBarcodes = [.. Enumerable.Range(1, 100).Select(x => x.ToString())];
+        private static readonly List<string> _dummyBarcodes = [.. Enumerable.Range(1, 1000).Select(x => x.ToString())];
         private static readonly List<string> _dummyAssetBarcodes = [.. Enumerable.Range(1, 50).Select(x => x.ToString())];
-        private static readonly List<string> _dummyLocationBarcodes = [.. Enumerable.Range(51, 100).Select(x => x.ToString())];
+        private static readonly List<string> _dummyLocationBarcodes = [.. Enumerable.Range(51, 1000).Select(x => x.ToString())];
 
         [HttpGet("validate/{barcode}")]
         public ActionResult<bool> ValidateBarcode(string barcode)

@@ -12,6 +12,11 @@ const int serverPort = 5000;
 const int MAX_BARCODES = 20;
 const unsigned long TIMEOUT_MS = 60000;
 
+// Pins
+const int buzzerPin = 8;
+const int redPin = 7;
+const int greenPin = 6;
+
 // State
 String barcodes[MAX_BARCODES];
 int count = 0;
@@ -41,12 +46,17 @@ void setup() {
   Serial.begin(115200);
   while (!Serial);
   
+  pinMode(buzzerPin, OUTPUT);
+  pinMode(redPin, OUTPUT);
+  pinMode(greenPin, OUTPUT);
+  
   if (Usb.Init() == -1) { Serial.println("USB failed"); while(1); }
   delay(200);
   Kbd.SetReportParser(0, &parser);
   
   while (status != WL_CONNECTED) { status = WiFi.begin(ssid, pass); delay(5000); }
   Serial.print("IP: "); Serial.println(WiFi.localIP());
+  digitalWrite(greenPin, HIGH); tone(buzzerPin, 2000, 30); delay(50); tone(buzzerPin, 2500, 30); delay(50); digitalWrite(greenPin, LOW);
   
   lastScan = millis();
   printList();
@@ -54,7 +64,7 @@ void setup() {
 
 void loop() {
   Usb.Task();
-  if (count > 0 && millis() - lastScan > TIMEOUT_MS) { reset(); }
+  if (count > 0 && millis() - lastScan > TIMEOUT_MS) { beepError(); reset(); printList(); lastScan = millis(); }
   if (ready) {
     process(barcode);
     barcode = "";
@@ -65,25 +75,30 @@ void loop() {
 
 void process(String b) {
   b.trim(); b.toUpperCase();
+  beepScan();
   Serial.print("> "); Serial.println(b);
   
   if (b == "SEND") {
-    if (count < 2) { Serial.println("Need 2+ barcodes"); }
-    else if (relocate()) { Serial.println("OK"); reset(); }
-    else { Serial.println("FAILED"); }
+    if (count < 2) { Serial.println("Need 2+ barcodes"); beepError(); }
+    else if (relocate()) { Serial.println("OK"); beepOK(); beepOK(); reset(); }
+    else { Serial.println("FAILED"); beepError(); reset(); }
   }
-  else if (b == "UNDO") { if (count > 0) { count--; barcodes[count] = ""; } }
-  else if (b == "RESET") { reset(); }
+  else if (b == "UNDO") { if (count > 0) { count--; barcodes[count] = ""; beepOK(); } }
+  else if (b == "RESET") { reset(); beepOK(); }
   else {
     if (count >= MAX_BARCODES) return;
-    for (int i = 0; i < count; i++) if (barcodes[i] == b) { Serial.println("Duplicate"); printList(); return; }
-    if (validate(b)) { barcodes[count++] = b; Serial.println("Added"); }
-    else { Serial.println("Invalid"); }
+    for (int i = 0; i < count; i++) if (barcodes[i] == b) { Serial.println("Duplicate"); beepError(); printList(); return; }
+    if (validate(b)) { barcodes[count++] = b; Serial.println("Added"); beepOK(); }
+    else { Serial.println("Invalid"); beepError(); }
   }
   printList();
 }
 
 void reset() { for (int i = 0; i < count; i++) barcodes[i] = ""; count = 0; }
+
+void beepOK() { digitalWrite(greenPin, HIGH); tone(buzzerPin, 2000, 30); delay(50); digitalWrite(greenPin, LOW); }
+void beepError() { digitalWrite(redPin, HIGH); tone(buzzerPin, 500, 80); delay(100); digitalWrite(redPin, LOW); }
+void beepScan() { tone(buzzerPin, 1500, 15); }
 
 void printList() {
   Serial.print("List["); Serial.print(count); Serial.print("]: ");
