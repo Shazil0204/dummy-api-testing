@@ -9,7 +9,7 @@ char ssid[] = "prog";
 char pass[] = "Alvorlig5And";
 const char* serverIP = "10.108.138.61";
 const int serverPort = 5000;
-const int MAX_BARCODES = 20;
+const int MAX_BARCODES = Long.MAX_VALUE; // No practical limit for this MVP, can be adjusted as needed
 const unsigned long TIMEOUT_MS = 60000;
 
 // Pins
