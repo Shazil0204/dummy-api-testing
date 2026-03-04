@@ -7,7 +7,7 @@
 // Config
 char ssid[] = "prog";
 char pass[] = "Alvorlig5And";
-const char* serverIP = "10.108.131.103";
+const char* serverIP = "10.108.138.61";
 const int serverPort = 5000;
 const int MAX_BARCODES = 20;
 const unsigned long TIMEOUT_MS = 60000;
@@ -154,10 +154,12 @@ bool httpRequest(String method, String url, String body = "") {
     delay(10);
   }
   
-  // Read just enough to find "true" - don't store entire response
-  bool foundTrue = false;
+  // Read status line to check for 200 OK or body containing "true"
+  bool success = false;
+  bool statusLineRead = false;
   bool inBody = false;
   int crlfCount = 0;
+  String statusLine = "";
   
   t = millis();
   while (client.connected() || client.available()) {
@@ -165,19 +167,31 @@ bool httpRequest(String method, String url, String body = "") {
     Usb.Task();
     while (client.available()) {
       char c = client.read();
+      
+      // Read the first line (status line) to get HTTP status code
+      if (!statusLineRead) {
+        if (c == '\r' || c == '\n') {
+          statusLineRead = true;
+          // Check for 200 status code
+          if (statusLine.indexOf("200") >= 0) success = true;
+        } else {
+          statusLine += c;
+        }
+      }
+      
       if (!inBody) {
         if (c == '\r' || c == '\n') crlfCount++;
         else crlfCount = 0;
         if (crlfCount >= 4) inBody = true;
       } else {
+        // Also check body for "true" (for validate endpoint)
         if (c == 't' || c == 'T') {
-          // Check for "true"
           String check = "t";
           for (int i = 0; i < 3 && client.available(); i++) {
             check += (char)client.read();
           }
           check.toLowerCase();
-          if (check == "true") foundTrue = true;
+          if (check == "true") success = true;
         }
       }
     }
@@ -185,7 +199,7 @@ bool httpRequest(String method, String url, String body = "") {
   }
   
   client.stop();
-  return foundTrue;
+  return success;
 }
 
 bool validate(String b) { return httpRequest("GET", "/api/Asset/validate/" + b); }
