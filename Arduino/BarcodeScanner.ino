@@ -16,6 +16,7 @@ const unsigned long TIMEOUT_MS = 60000;
 const int buzzerPin = 8;
 const int redPin = 7;
 const int greenPin = 6;
+const int bluePin = 5;
 
 // State
 String barcodes[MAX_BARCODES];
@@ -49,14 +50,54 @@ void setup() {
   pinMode(buzzerPin, OUTPUT);
   pinMode(redPin, OUTPUT);
   pinMode(greenPin, OUTPUT);
+  pinMode(bluePin, OUTPUT);
   
   if (Usb.Init() == -1) { Serial.println("USB failed"); while(1); }
   delay(200);
   Kbd.SetReportParser(0, &parser);
   
-  while (status != WL_CONNECTED) { status = WiFi.begin(ssid, pass); delay(5000); }
+  // WiFi connection with visual/audio feedback
+  Serial.println("Connecting to WiFi...");
+  while (status != WL_CONNECTED) {
+    status = WiFi.begin(ssid, pass);
+    if (status != WL_CONNECTED) {
+      // Connection failed - red light + error beep
+      digitalWrite(greenPin, LOW);
+      digitalWrite(redPin, HIGH);
+      // Super Mario Bros - Death Sound (WiFi Failed ❌)
+
+      tone(buzzerPin, 523, 150); delay(180);   // C5
+      tone(buzzerPin, 494, 150); delay(180);   // B4
+      tone(buzzerPin, 466, 150); delay(180);   // A#4
+      tone(buzzerPin, 440, 300); delay(320);   // A4
+
+      tone(buzzerPin, 415, 150); delay(180);   // G#4
+      tone(buzzerPin, 392, 400); delay(450);   // G4 (sad fall)
+      Serial.println("WiFi connection failed, retrying in 5 sec...");
+      delay(5000);
+      digitalWrite(redPin, LOW);
+    }
+  }
+  // Connected - turn green LED on and keep it on
+  digitalWrite(redPin, LOW);
+  digitalWrite(greenPin, HIGH);
   Serial.print("IP: "); Serial.println(WiFi.localIP());
-  digitalWrite(greenPin, HIGH); tone(buzzerPin, 2000, 30); delay(50); tone(buzzerPin, 2500, 30); delay(50); digitalWrite(greenPin, LOW);
+  
+  // Super Mario Bros - Intro (WiFi Connected Style 🎮)
+
+  tone(buzzerPin, 659, 150); delay(180);  // E5
+  tone(buzzerPin, 659, 150); delay(180);  // E5
+  delay(150);
+
+  tone(buzzerPin, 659, 150); delay(180);  // E5
+  delay(150);
+
+  tone(buzzerPin, 523, 150); delay(180);  // C5
+  tone(buzzerPin, 659, 150); delay(180);  // E5
+  tone(buzzerPin, 784, 300); delay(350);  // G5
+  delay(200);
+
+  tone(buzzerPin, 392, 300); delay(350);  // G4
   
   lastScan = millis();
   printList();
@@ -70,7 +111,23 @@ void loop() {
   if (millis() - lastWifiCheck > 30000) {
     lastWifiCheck = millis();
     if (WiFi.status() != WL_CONNECTED) {
-      Serial.println("WiFi disconnected");
+      Serial.println("WiFi disconnected, reconnecting...");
+      digitalWrite(greenPin, LOW);
+      digitalWrite(redPin, HIGH);
+      tone(buzzerPin, 500, 200);
+      WiFi.disconnect();
+      delay(100);
+      status = WL_IDLE_STATUS;
+      while (status != WL_CONNECTED) {
+        status = WiFi.begin(ssid, pass);
+        if (status != WL_CONNECTED) {
+          tone(buzzerPin, 500, 200);
+          delay(5000);
+        }
+      }
+      digitalWrite(redPin, LOW);
+      digitalWrite(greenPin, HIGH);
+      Serial.print("Reconnected IP: "); Serial.println(WiFi.localIP());
     }
   }
   
@@ -89,25 +146,62 @@ void process(String b) {
   Serial.print("> "); Serial.println(b);
   
   if (b == "SEND") {
+    // No blue light for SEND - handle separately
     if (count < 2) { Serial.println("Need 2+ barcodes"); beepError(); }
-    else if (relocate()) { Serial.println("OK"); beepOK(); beepOK(); reset(); }
-    else { Serial.println("FAILED"); beepError(); reset(); }
+    else if (relocate()) { 
+      Serial.println("OK"); 
+      // Success - blink blue 3 times (longer duration)
+      for (int i = 0; i < 3; i++) {
+        digitalWrite(greenPin, LOW);
+        digitalWrite(bluePin, HIGH);
+        tone(buzzerPin, 2000, 100);
+        delay(300);
+        digitalWrite(bluePin, LOW);
+        digitalWrite(greenPin, HIGH);
+        delay(150);
+      }
+      reset(); 
+    }
+    else { 
+      // Failed - show red
+      Serial.println("FAILED"); 
+      beepError(); 
+      reset(); 
+    }
+    printList();
+    return;
   }
-  else if (b == "UNDO") { if (count > 0) { count--; barcodes[count] = ""; beepOK(); } }
+  
+  // Blue light while processing regular barcodes
+  digitalWrite(greenPin, LOW);
+  digitalWrite(bluePin, HIGH);
+  
+  if (b == "UNDO") { if (count > 0) { count--; barcodes[count] = ""; beepOK(); } }
   else if (b == "RESET") { reset(); beepOK(); }
   else {
-    if (count >= MAX_BARCODES) return;
+    if (count >= MAX_BARCODES) { beepError(); printList(); return; }
     for (int i = 0; i < count; i++) if (barcodes[i] == b) { Serial.println("Duplicate"); beepError(); printList(); return; }
     if (validate(b)) { barcodes[count++] = b; Serial.println("Added"); beepOK(); }
     else { Serial.println("Invalid"); beepError(); }
   }
+  // Back to green after processing
+  digitalWrite(bluePin, LOW);
+  digitalWrite(greenPin, HIGH);
   printList();
 }
 
 void reset() { for (int i = 0; i < count; i++) barcodes[i] = ""; count = 0; }
 
-void beepOK() { digitalWrite(greenPin, HIGH); tone(buzzerPin, 2000, 30); delay(50); digitalWrite(greenPin, LOW); }
-void beepError() { digitalWrite(redPin, HIGH); tone(buzzerPin, 500, 80); delay(100); digitalWrite(redPin, LOW); }
+void beepOK() { tone(buzzerPin, 2000, 30); delay(50); }
+void beepError() { 
+  digitalWrite(bluePin, LOW);
+  digitalWrite(greenPin, LOW);
+  digitalWrite(redPin, HIGH); 
+  tone(buzzerPin, 500, 80); 
+  delay(100); 
+  digitalWrite(redPin, LOW); 
+  digitalWrite(greenPin, HIGH);
+}
 void beepScan() { tone(buzzerPin, 1500, 15); }
 
 void printList() {
@@ -120,10 +214,22 @@ bool httpRequest(String method, String url, String body = "") {
   // Check WiFi and reconnect if needed
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println("WiFi lost, reconnecting...");
+    digitalWrite(greenPin, LOW);
+    digitalWrite(bluePin, LOW);
+    digitalWrite(redPin, HIGH);
+    tone(buzzerPin, 500, 200);
     WiFi.disconnect();
     delay(100);
     status = WL_IDLE_STATUS;
-    while (status != WL_CONNECTED) { status = WiFi.begin(ssid, pass); delay(3000); }
+    while (status != WL_CONNECTED) {
+      status = WiFi.begin(ssid, pass);
+      if (status != WL_CONNECTED) {
+        tone(buzzerPin, 500, 200);
+        delay(5000);
+      }
+    }
+    digitalWrite(redPin, LOW);
+    digitalWrite(greenPin, HIGH);
     Serial.print("Reconnected IP: "); Serial.println(WiFi.localIP());
   }
   
