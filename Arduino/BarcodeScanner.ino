@@ -7,9 +7,11 @@
 // Config
 char ssid[] = "prog";
 char pass[] = "Alvorlig5And";
-const char* serverIP = "10.108.138.61";
-const int serverPort = 5000;
-const int MAX_BARCODES = 500; // Max ~500 for Arduino R4 WiFi RAM limits
+const char* serverHost = "inventorysystem.acceptable.pro";
+const int serverPort = 443;
+const char* cfClientId = "fd0f2455c8ef15b1f83d6315190ee48b.access";
+const char* cfClientSecret = "7e4a0b4cefbd617e5b0a9be60444ea07eafcd7d6c2fe76cddf458ad5885bf7e4";
+const int MAX_BARCODES = 200; // Max ~200 for Arduino R4 WiFi RAM limits
 const unsigned long TIMEOUT_MS = 60000;
 
 // Pins
@@ -29,7 +31,7 @@ bool ready = false;
 // USB
 USB Usb;
 HIDBoot<USB_HID_PROTOCOL_KEYBOARD> Kbd(&Usb);
-WiFiClient client;
+WiFiSSLClient client; // SSL client for HTTPS
 
 class KbdParser : public KeyboardReportParser {
 protected:
@@ -310,7 +312,7 @@ int httpRequestWithStatus(String method, String url, String body = "") {
   bool connected = false;
   while (connectRetries > 0 && !connected) {
     Usb.Task();
-    if (client.connect(serverIP, serverPort)) {
+    if (client.connect(serverHost, serverPort)) {
       connected = true;
     } else {
       connectRetries--;
@@ -329,7 +331,9 @@ int httpRequestWithStatus(String method, String url, String body = "") {
   }
   
   client.print(method + " " + url + " HTTP/1.1\r\n");
-  client.print("Host: " + String(serverIP) + ":" + serverPort + "\r\n");
+  client.print("Host: " + String(serverHost) + "\r\n");
+  client.print("CF-Access-Client-Id: " + String(cfClientId) + "\r\n");
+  client.print("CF-Access-Client-Secret: " + String(cfClientSecret) + "\r\n");
   if (body.length() > 0) {
     client.print("Content-Type: application/json\r\n");
     client.print("Content-Length: " + String(body.length()) + "\r\n");
@@ -350,12 +354,15 @@ int httpRequestWithStatus(String method, String url, String body = "") {
     delay(10);
   }
   
-  // Read status line to check for 200 OK or body containing "true"
-  bool success = false;
+  // Read status line to check for 200 OK and body content
+  bool is200 = false;
+  bool bodyTrue = false;
+  bool bodyFalse = false;
   bool statusLineRead = false;
   bool inBody = false;
   int crlfCount = 0;
   String statusLine = "";
+  String bodyContent = "";
   
   t = millis();
   while (client.connected() || client.available()) {
@@ -369,7 +376,7 @@ int httpRequestWithStatus(String method, String url, String body = "") {
         if (c == '\r' || c == '\n') {
           statusLineRead = true;
           // Check for 200 status code
-          if (statusLine.indexOf("200") >= 0) success = true;
+          if (statusLine.indexOf("200") >= 0) is200 = true;
         } else {
           statusLine += c;
         }
@@ -380,22 +387,27 @@ int httpRequestWithStatus(String method, String url, String body = "") {
         else crlfCount = 0;
         if (crlfCount >= 4) inBody = true;
       } else {
-        // Also check body for "true" (for validate endpoint)
-        if (c == 't' || c == 'T') {
-          String check = "t";
-          for (int i = 0; i < 3 && client.available(); i++) {
-            check += (char)client.read();
-          }
-          check.toLowerCase();
-          if (check == "true") success = true;
+        // Collect body content (limit to prevent memory issues)
+        if (bodyContent.length() < 50) {
+          bodyContent += c;
         }
       }
     }
     delay(1);
   }
   
+  // Check body content for true/false
+  bodyContent.toLowerCase();
+  if (bodyContent.indexOf("true") >= 0) bodyTrue = true;
+  if (bodyContent.indexOf("false") >= 0) bodyFalse = true;
+  
   client.stop();
-  return success ? 1 : 0;
+  
+  // Success if: HTTP 200 AND (body says "true" OR body doesn't say "false")
+  // This handles both validate (returns true/false) and relocate (returns 200 on success)
+  if (!is200) return 0; // Server returned error status
+  if (bodyFalse) return 0; // Body explicitly says false
+  return 1; // 200 with "true" or no true/false in body = success
 }
 
 // Legacy wrapper for backwards compatibility
