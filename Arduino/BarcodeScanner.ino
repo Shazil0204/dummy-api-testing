@@ -9,7 +9,7 @@ char ssid[] = "prog";
 char pass[] = "Alvorlig5And";
 const char* serverIP = "10.108.138.61";
 const int serverPort = 5000;
-const int MAX_BARCODES = Long.MAX_VALUE; // No practical limit for this MVP, can be adjusted as needed
+const int MAX_BARCODES = 500; // Max ~500 for Arduino R4 WiFi RAM limits
 const unsigned long TIMEOUT_MS = 60000;
 
 // Pins
@@ -148,25 +148,35 @@ void process(String b) {
   if (b == "SEND") {
     // No blue light for SEND - handle separately
     if (count < 2) { Serial.println("Need 2+ barcodes"); beepError(); }
-    else if (relocate()) { 
-      Serial.println("OK"); 
-      // Success - blink blue 3 times (longer duration)
-      for (int i = 0; i < 3; i++) {
-        digitalWrite(greenPin, LOW);
-        digitalWrite(bluePin, HIGH);
-        tone(buzzerPin, 2000, 100);
-        delay(300);
-        digitalWrite(bluePin, LOW);
-        digitalWrite(greenPin, HIGH);
-        delay(150);
+    else {
+      int result = relocateWithStatus();
+      if (result == 1) { 
+        Serial.println("OK"); 
+        // Success - blink blue 3 times (longer duration)
+        for (int i = 0; i < 3; i++) {
+          digitalWrite(greenPin, LOW);
+          digitalWrite(bluePin, HIGH);
+          tone(buzzerPin, 2000, 100);
+          delay(300);
+          digitalWrite(bluePin, LOW);
+          digitalWrite(greenPin, HIGH);
+          delay(150);
+          Usb.Task();
+        }
+        reset(); 
       }
-      reset(); 
-    }
-    else { 
-      // Failed - show red
-      Serial.println("FAILED"); 
-      beepError(); 
-      reset(); 
+      else if (result == -1) {
+        // Connection error - distinct feedback, keep barcodes for retry
+        beepConnectionError();
+        Serial.println("Connection failed - barcodes kept, try SEND again");
+        // Don't reset - let user retry
+      }
+      else { 
+        // Server rejected (result == 0)
+        Serial.println("FAILED - Server rejected"); 
+        beepError(); 
+        reset(); 
+      }
     }
     printList();
     return;
@@ -179,10 +189,23 @@ void process(String b) {
   if (b == "UNDO") { if (count > 0) { count--; barcodes[count] = ""; beepOK(); } }
   else if (b == "RESET") { reset(); beepOK(); }
   else {
-    if (count >= MAX_BARCODES) { beepError(); printList(); return; }
-    for (int i = 0; i < count; i++) if (barcodes[i] == b) { Serial.println("Duplicate"); beepError(); printList(); return; }
-    if (validate(b)) { barcodes[count++] = b; Serial.println("Added"); beepOK(); }
-    else { Serial.println("Invalid"); beepError(); }
+    if (count >= MAX_BARCODES) { beepError(); printList(); digitalWrite(bluePin, LOW); digitalWrite(greenPin, HIGH); return; }
+    for (int i = 0; i < count; i++) if (barcodes[i] == b) { Serial.println("Duplicate"); beepError(); printList(); digitalWrite(bluePin, LOW); digitalWrite(greenPin, HIGH); return; }
+    int result = validateWithStatus(b);
+    if (result == 1) { 
+      barcodes[count++] = b; 
+      Serial.println("Added"); 
+      beepOK(); 
+    }
+    else if (result == -1) {
+      // Connection error - distinct feedback
+      Serial.println("Cannot validate - server not responding");
+      beepConnectionError();
+    }
+    else { 
+      Serial.println("Invalid"); 
+      beepError(); 
+    }
   }
   // Back to green after processing
   digitalWrite(bluePin, LOW);
@@ -202,6 +225,42 @@ void beepError() {
   digitalWrite(redPin, LOW); 
   digitalWrite(greenPin, HIGH);
 }
+void beepConnectionError() {
+  // Super Mario Bros - Game Over Theme (Server Not Responding 🎮)
+  Serial.println("CONNECTION ERROR - Server not responding!");
+  digitalWrite(greenPin, LOW);
+  digitalWrite(bluePin, LOW);
+  digitalWrite(redPin, HIGH);
+  
+  // Game Over melody
+  tone(buzzerPin, 392, 200); delay(220);   // G4
+  Usb.Task();
+  tone(buzzerPin, 350, 200); delay(220);   // ~F4
+  Usb.Task();
+  tone(buzzerPin, 330, 200); delay(220);   // E4
+  Usb.Task();
+  
+  // Blink red/blue
+  digitalWrite(redPin, LOW);
+  digitalWrite(bluePin, HIGH);
+  
+  tone(buzzerPin, 262, 200); delay(220);   // C4
+  Usb.Task();
+  tone(buzzerPin, 294, 200); delay(220);   // D4
+  Usb.Task();
+  tone(buzzerPin, 247, 200); delay(220);   // B3
+  Usb.Task();
+  
+  digitalWrite(bluePin, LOW);
+  digitalWrite(redPin, HIGH);
+  
+  tone(buzzerPin, 262, 300); delay(350);   // C4 (held)
+  Usb.Task();
+  tone(buzzerPin, 196, 500); delay(550);   // G3 (low end)
+  
+  digitalWrite(redPin, LOW);
+  digitalWrite(greenPin, HIGH); // Return to ready state
+}
 void beepScan() { tone(buzzerPin, 1500, 15); }
 
 void printList() {
@@ -210,7 +269,8 @@ void printList() {
   Serial.println();
 }
 
-bool httpRequest(String method, String url, String body = "") {
+// Return codes: 1 = success, 0 = server said no/invalid, -1 = connection error
+int httpRequestWithStatus(String method, String url, String body = "") {
   // Check WiFi and reconnect if needed
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println("WiFi lost, reconnecting...");
@@ -221,12 +281,20 @@ bool httpRequest(String method, String url, String body = "") {
     WiFi.disconnect();
     delay(100);
     status = WL_IDLE_STATUS;
-    while (status != WL_CONNECTED) {
+    int retryCount = 0;
+    while (status != WL_CONNECTED && retryCount < 3) {
+      Usb.Task(); // Keep USB alive
       status = WiFi.begin(ssid, pass);
       if (status != WL_CONNECTED) {
         tone(buzzerPin, 500, 200);
-        delay(5000);
+        retryCount++;
+        for (int i = 0; i < 50; i++) { delay(100); Usb.Task(); } // 5 sec with USB task
       }
+    }
+    if (status != WL_CONNECTED) {
+      digitalWrite(redPin, LOW);
+      digitalWrite(greenPin, HIGH);
+      return -1; // Connection error
     }
     digitalWrite(redPin, LOW);
     digitalWrite(greenPin, HIGH);
@@ -237,9 +305,27 @@ bool httpRequest(String method, String url, String body = "") {
   client.stop();
   delay(10);
   
-  if (!client.connect(serverIP, serverPort)) {
-    Serial.println("Connect failed");
-    return false;
+  // Try to connect with retries
+  int connectRetries = 2;
+  bool connected = false;
+  while (connectRetries > 0 && !connected) {
+    Usb.Task();
+    if (client.connect(serverIP, serverPort)) {
+      connected = true;
+    } else {
+      connectRetries--;
+      if (connectRetries > 0) {
+        Serial.println("Connect retry...");
+        delay(500);
+        Usb.Task();
+      }
+    }
+  }
+  
+  if (!connected) {
+    Serial.println("Connect failed - server not responding");
+    client.stop();
+    return -1; // Connection error
   }
   
   client.print(method + " " + url + " HTTP/1.1\r\n");
@@ -256,7 +342,11 @@ bool httpRequest(String method, String url, String body = "") {
   unsigned long t = millis();
   while (!client.available()) {
     Usb.Task(); // Keep USB alive
-    if (millis() - t > 5000) { client.stop(); return false; }
+    if (millis() - t > 5000) { 
+      Serial.println("Response timeout");
+      client.stop(); 
+      return -1; // Connection/timeout error
+    }
     delay(10);
   }
   
@@ -305,17 +395,24 @@ bool httpRequest(String method, String url, String body = "") {
   }
   
   client.stop();
-  return success;
+  return success ? 1 : 0;
 }
 
-bool validate(String b) { return httpRequest("GET", "/api/Asset/validate/" + b); }
+// Legacy wrapper for backwards compatibility
+bool httpRequest(String method, String url, String body = "") {
+  return httpRequestWithStatus(method, url, body) == 1;
+}
 
-bool relocate() {
+// Returns: 1 = valid, 0 = invalid, -1 = connection error
+int validateWithStatus(String b) { return httpRequestWithStatus("GET", "/api/Asset/validate/" + b); }
+
+// Returns: 1 = success, 0 = server rejected, -1 = connection error
+int relocateWithStatus() {
   String json = "{\"AssetBarcodes\":[";
   for (int i = 0; i < count - 1; i++) {
     json += "\"" + barcodes[i] + "\"";
     if (i < count - 2) json += ",";
   }
   json += "],\"DestinationBarcode\":\"" + barcodes[count - 1] + "\"}";
-  return httpRequest("POST", "/api/Asset/relocate", json);
+  return httpRequestWithStatus("POST", "/api/Asset/relocate", json);
 }
