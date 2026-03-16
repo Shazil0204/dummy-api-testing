@@ -3,6 +3,7 @@
 #include <hidboot.h>
 #include <usbhub.h>
 #include <SPI.h>
+#include <new>
 
 // Config
 char ssid[] = "prog";
@@ -11,7 +12,6 @@ const char* serverHost = "inventorysystem.acceptable.pro";
 const int serverPort = 443;
 const char* cfClientId = "fd0f2455c8ef15b1f83d6315190ee48b.access";
 const char* cfClientSecret = "7e4a0b4cefbd617e5b0a9be60444ea07eafcd7d6c2fe76cddf458ad5885bf7e4";
-const int MAX_BARCODES = 200; // Max ~200 for Arduino R4 WiFi RAM limits
 const unsigned long TIMEOUT_MS = 60000;
 
 // Pins
@@ -21,7 +21,13 @@ const int greenPin = 6;
 const int bluePin = 5;
 
 // State
-String barcodes[MAX_BARCODES];
+struct BarcodeNode {
+  String value;
+  BarcodeNode* next;
+};
+
+BarcodeNode* head = nullptr;
+BarcodeNode* tail = nullptr;
 int count = 0;
 int status = WL_IDLE_STATUS;
 unsigned long lastScan = 0;
@@ -44,6 +50,51 @@ protected:
   }
 };
 KbdParser parser;
+
+bool containsBarcode(const String& value) {
+  BarcodeNode* current = head;
+  while (current) {
+    if (current->value == value) return true;
+    current = current->next;
+  }
+  return false;
+}
+
+bool appendBarcode(const String& value) {
+  BarcodeNode* node = new (std::nothrow) BarcodeNode{value, nullptr};
+  if (!node) return false;
+
+  if (!head) {
+    head = node;
+    tail = node;
+  } else {
+    tail->next = node;
+    tail = node;
+  }
+  count++;
+  return true;
+}
+
+bool popLastBarcode() {
+  if (!head) return false;
+
+  if (head == tail) {
+    delete head;
+    head = nullptr;
+    tail = nullptr;
+    count = 0;
+    return true;
+  }
+
+  BarcodeNode* current = head;
+  while (current->next != tail) current = current->next;
+
+  delete tail;
+  tail = current;
+  tail->next = nullptr;
+  count--;
+  return true;
+}
 
 void setup() {
   Serial.begin(115200);
@@ -188,26 +239,13 @@ void process(String b) {
   digitalWrite(greenPin, LOW);
   digitalWrite(bluePin, HIGH);
   
-  if (b == "UNDO") { if (count > 0) { count--; barcodes[count] = ""; beepOK(); } }
+  if (b == "UNDO") { if (count > 0) { popLastBarcode(); beepOK(); } }
   else if (b == "RESET") { reset(); beepOK(); }
   else {
-    if (count >= MAX_BARCODES) { beepError(); printList(); digitalWrite(bluePin, LOW); digitalWrite(greenPin, HIGH); return; }
-    for (int i = 0; i < count; i++) if (barcodes[i] == b) { Serial.println("Duplicate"); beepError(); printList(); digitalWrite(bluePin, LOW); digitalWrite(greenPin, HIGH); return; }
-    int result = validateWithStatus(b);
-    if (result == 1) { 
-      barcodes[count++] = b; 
-      Serial.println("Added"); 
-      beepOK(); 
-    }
-    else if (result == -1) {
-      // Connection error - distinct feedback
-      Serial.println("Cannot validate - server not responding");
-      beepConnectionError();
-    }
-    else { 
-      Serial.println("Invalid"); 
-      beepError(); 
-    }
+    if (containsBarcode(b)) { Serial.println("Duplicate"); beepError(); printList(); digitalWrite(bluePin, LOW); digitalWrite(greenPin, HIGH); return; }
+    if (!appendBarcode(b)) { Serial.println("Out of memory"); beepError(); printList(); digitalWrite(bluePin, LOW); digitalWrite(greenPin, HIGH); return; }
+    Serial.println("Added");
+    beepOK();
   }
   // Back to green after processing
   digitalWrite(bluePin, LOW);
@@ -215,7 +253,17 @@ void process(String b) {
   printList();
 }
 
-void reset() { for (int i = 0; i < count; i++) barcodes[i] = ""; count = 0; }
+void reset() {
+  BarcodeNode* current = head;
+  while (current) {
+    BarcodeNode* next = current->next;
+    delete current;
+    current = next;
+  }
+  head = nullptr;
+  tail = nullptr;
+  count = 0;
+}
 
 void beepOK() { tone(buzzerPin, 2000, 30); delay(50); }
 void beepError() { 
@@ -267,11 +315,16 @@ void beepScan() { tone(buzzerPin, 1500, 15); }
 
 void printList() {
   Serial.print("List["); Serial.print(count); Serial.print("]: ");
-  for (int i = 0; i < count; i++) { Serial.print(barcodes[i]); if (i < count-1) Serial.print(","); }
+  BarcodeNode* current = head;
+  while (current) {
+    Serial.print(current->value);
+    if (current->next) Serial.print(",");
+    current = current->next;
+  }
   Serial.println();
 }
 
-// Return codes: 1 = success, 0 = server said no/invalid, -1 = connection error
+// Return codes: 1 = success, 0 = server rejected, -1 = connection error
 int httpRequestWithStatus(String method, String url, String body = "") {
   // Check WiFi and reconnect if needed
   if (WiFi.status() != WL_CONNECTED) {
@@ -354,15 +407,10 @@ int httpRequestWithStatus(String method, String url, String body = "") {
     delay(10);
   }
   
-  // Read status line to check for 200 OK and body content
+  // Read status line to check for HTTP 200.
   bool is200 = false;
-  bool bodyTrue = false;
-  bool bodyFalse = false;
   bool statusLineRead = false;
-  bool inBody = false;
-  int crlfCount = 0;
   String statusLine = "";
-  String bodyContent = "";
   
   t = millis();
   while (client.connected() || client.available()) {
@@ -382,49 +430,26 @@ int httpRequestWithStatus(String method, String url, String body = "") {
         }
       }
       
-      if (!inBody) {
-        if (c == '\r' || c == '\n') crlfCount++;
-        else crlfCount = 0;
-        if (crlfCount >= 4) inBody = true;
-      } else {
-        // Collect body content (limit to prevent memory issues)
-        if (bodyContent.length() < 50) {
-          bodyContent += c;
-        }
-      }
     }
     delay(1);
   }
   
-  // Check body content for true/false
-  bodyContent.toLowerCase();
-  if (bodyContent.indexOf("true") >= 0) bodyTrue = true;
-  if (bodyContent.indexOf("false") >= 0) bodyFalse = true;
-  
   client.stop();
   
-  // Success if: HTTP 200 AND (body says "true" OR body doesn't say "false")
-  // This handles both validate (returns true/false) and relocate (returns 200 on success)
-  if (!is200) return 0; // Server returned error status
-  if (bodyFalse) return 0; // Body explicitly says false
-  return 1; // 200 with "true" or no true/false in body = success
+  // Relocate endpoint succeeds on HTTP 200.
+  if (!is200) return 0;
+  return 1;
 }
-
-// Legacy wrapper for backwards compatibility
-bool httpRequest(String method, String url, String body = "") {
-  return httpRequestWithStatus(method, url, body) == 1;
-}
-
-// Returns: 1 = valid, 0 = invalid, -1 = connection error
-int validateWithStatus(String b) { return httpRequestWithStatus("GET", "/api/Asset/validate/" + b); }
 
 // Returns: 1 = success, 0 = server rejected, -1 = connection error
 int relocateWithStatus() {
   String json = "{\"AssetBarcodes\":[";
-  for (int i = 0; i < count - 1; i++) {
-    json += "\"" + barcodes[i] + "\"";
-    if (i < count - 2) json += ",";
+  BarcodeNode* current = head;
+  while (current && current != tail) {
+    json += "\"" + current->value + "\"";
+    if (current->next && current->next != tail) json += ",";
+    current = current->next;
   }
-  json += "],\"DestinationBarcode\":\"" + barcodes[count - 1] + "\"}";
+  json += "],\"DestinationBarcode\":\"" + tail->value + "\"}";
   return httpRequestWithStatus("POST", "/api/Asset/relocate", json);
 }
