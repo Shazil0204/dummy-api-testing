@@ -3,16 +3,25 @@
 #include <hidboot.h>
 #include <usbhub.h>
 #include <SPI.h>
+#include <EEPROM.h>
 #include <new>
 
 // Config
-char ssid[] = "prog";
-char pass[] = "Alvorlig5And";
+const char defaultSsid[] = "prog";
+const char defaultPass[] = "Alvorlig5And";
+char ssid[33] = "";
+char pass[65] = "";
 const char* serverHost = "inventorysystem.acceptable.pro";
 const int serverPort = 443;
 const char* cfClientId = "fd0f2455c8ef15b1f83d6315190ee48b.access";
 const char* cfClientSecret = "7e4a0b4cefbd617e5b0a9be60444ea07eafcd7d6c2fe76cddf458ad5885bf7e4";
 const unsigned long TIMEOUT_MS = 60000;
+
+// EEPROM layout
+const uint16_t EEPROM_MAGIC = 0xBEEF;
+const int EEPROM_MAGIC_ADDR = 0;
+const int EEPROM_SSID_ADDR = 4;
+const int EEPROM_PASS_ADDR = 37;
 
 // Pins
 const int buzzerPin = 8;
@@ -33,6 +42,8 @@ int status = WL_IDLE_STATUS;
 unsigned long lastScan = 0;
 String barcode = "";
 bool ready = false;
+bool wifiSetupMode = false;
+String pendingWifiSsid = "";
 
 // USB
 USB Usb;
@@ -50,6 +61,141 @@ protected:
   }
 };
 KbdParser parser;
+
+void initEepromStorage() {
+#if defined(ARDUINO_ARCH_ESP32) || defined(ARDUINO_ARCH_ESP8266)
+  EEPROM.begin(512);
+#endif
+}
+
+void flushEepromStorage() {
+#if defined(ARDUINO_ARCH_ESP32) || defined(ARDUINO_ARCH_ESP8266)
+  EEPROM.commit();
+#endif
+}
+
+void setLed(bool redOn, bool greenOn, bool blueOn) {
+  digitalWrite(redPin, redOn ? HIGH : LOW);
+  digitalWrite(greenPin, greenOn ? HIGH : LOW);
+  digitalWrite(bluePin, blueOn ? HIGH : LOW);
+}
+
+void beepWifiAlert() {
+  tone(buzzerPin, 523, 150); delay(180);
+  tone(buzzerPin, 494, 150); delay(180);
+  tone(buzzerPin, 440, 250); delay(280);
+}
+
+void playWiFiConnectedTune() {
+  // Startup success tune kept from the original version.
+  tone(buzzerPin, 659, 150); delay(180);
+  tone(buzzerPin, 659, 150); delay(180);
+  delay(150);
+
+  tone(buzzerPin, 659, 150); delay(180);
+  delay(150);
+
+  tone(buzzerPin, 523, 150); delay(180);
+  tone(buzzerPin, 659, 150); delay(180);
+  tone(buzzerPin, 784, 300); delay(350);
+  delay(200);
+
+  tone(buzzerPin, 392, 300); delay(350);
+}
+
+void copyCredentials(const char* newSsid, const char* newPass) {
+  strncpy(ssid, newSsid, sizeof(ssid) - 1);
+  ssid[sizeof(ssid) - 1] = '\0';
+  strncpy(pass, newPass, sizeof(pass) - 1);
+  pass[sizeof(pass) - 1] = '\0';
+}
+
+bool loadSavedWiFi() {
+  uint16_t magic = 0;
+  EEPROM.get(EEPROM_MAGIC_ADDR, magic);
+  if (magic != EEPROM_MAGIC) return false;
+
+  EEPROM.get(EEPROM_SSID_ADDR, ssid);
+  EEPROM.get(EEPROM_PASS_ADDR, pass);
+  ssid[sizeof(ssid) - 1] = '\0';
+  pass[sizeof(pass) - 1] = '\0';
+  return strlen(ssid) > 0;
+}
+
+void saveWiFi(const char* newSsid, const char* newPass) {
+  copyCredentials(newSsid, newPass);
+  uint16_t magic = EEPROM_MAGIC;
+  EEPROM.put(EEPROM_MAGIC_ADDR, magic);
+  EEPROM.put(EEPROM_SSID_ADDR, ssid);
+  EEPROM.put(EEPROM_PASS_ADDR, pass);
+  flushEepromStorage();
+}
+
+void clearSavedWiFi() {
+  memset(ssid, 0, sizeof(ssid));
+  memset(pass, 0, sizeof(pass));
+  uint16_t magic = 0;
+  EEPROM.put(EEPROM_MAGIC_ADDR, magic);
+  EEPROM.put(EEPROM_SSID_ADDR, ssid);
+  EEPROM.put(EEPROM_PASS_ADDR, pass);
+  flushEepromStorage();
+}
+
+bool connectWiFi(const char* s, const char* p, int attempts) {
+  while (attempts-- > 0) {
+    status = WiFi.begin(s, p);
+    unsigned long start = millis();
+    while (millis() - start < 12000) {
+      Usb.Task();
+      if (WiFi.status() == WL_CONNECTED) return true;
+      delay(100);
+    }
+    WiFi.disconnect();
+    delay(100);
+  }
+  return false;
+}
+
+void enterWifiSetupMode() {
+  wifiSetupMode = true;
+  pendingWifiSsid = "";
+  setLed(true, false, false);
+  beepWifiAlert();
+  Serial.println("WiFi missing/unconnectable. Scan SSID, then password.");
+}
+
+void flashBlueForSsidScanned() {
+  setLed(false, false, true);
+  delay(180);
+  setLed(true, false, false);
+}
+
+void handleWifiProvisionScan(const String& rawScan) {
+  if (pendingWifiSsid.length() == 0) {
+    pendingWifiSsid = rawScan;
+    Serial.print("SSID scanned: "); Serial.println(pendingWifiSsid);
+    flashBlueForSsidScanned();
+    return;
+  }
+
+  String pendingWifiPass = rawScan;
+  setLed(false, false, true); // steady blue while connecting
+  Serial.print("Connecting using SSID: "); Serial.println(pendingWifiSsid);
+
+  if (connectWiFi(pendingWifiSsid.c_str(), pendingWifiPass.c_str(), 2)) {
+    saveWiFi(pendingWifiSsid.c_str(), pendingWifiPass.c_str());
+    wifiSetupMode = false;
+    pendingWifiSsid = "";
+    setLed(false, true, false);
+    playWiFiConnectedTune();
+    Serial.print("WiFi connected and saved. IP: "); Serial.println(WiFi.localIP());
+  } else {
+    pendingWifiSsid = "";
+    setLed(true, false, false);
+    beepWifiAlert();
+    Serial.println("WiFi connect failed. Credentials not saved.");
+  }
+}
 
 bool containsBarcode(const String& value) {
   BarcodeNode* current = head;
@@ -104,53 +250,31 @@ void setup() {
   pinMode(redPin, OUTPUT);
   pinMode(greenPin, OUTPUT);
   pinMode(bluePin, OUTPUT);
+  // Show explicit startup/waiting state immediately.
+  setLed(true, false, false);
   
   if (Usb.Init() == -1) { Serial.println("USB failed"); while(1); }
   delay(200);
   Kbd.SetReportParser(0, &parser);
-  
-  // WiFi connection with visual/audio feedback
-  Serial.println("Connecting to WiFi...");
-  while (status != WL_CONNECTED) {
-    status = WiFi.begin(ssid, pass);
-    if (status != WL_CONNECTED) {
-      // Connection failed - red light + error beep
-      digitalWrite(greenPin, LOW);
-      digitalWrite(redPin, HIGH);
-      // Super Mario Bros - Death Sound (WiFi Failed ❌)
+  initEepromStorage();
 
-      tone(buzzerPin, 523, 150); delay(180);   // C5
-      tone(buzzerPin, 494, 150); delay(180);   // B4
-      tone(buzzerPin, 466, 150); delay(180);   // A#4
-      tone(buzzerPin, 440, 300); delay(320);   // A4
+  bool hasSaved = loadSavedWiFi();
+  if (!hasSaved) copyCredentials(defaultSsid, defaultPass);
 
-      tone(buzzerPin, 415, 150); delay(180);   // G#4
-      tone(buzzerPin, 392, 400); delay(450);   // G4 (sad fall)
-      Serial.println("WiFi connection failed, retrying in 5 sec...");
-      delay(5000);
-      digitalWrite(redPin, LOW);
-    }
+  Serial.println("Trying saved/default WiFi...");
+  setLed(true, false, false);
+  if (connectWiFi(ssid, pass, 2)) {
+    setLed(false, true, false);
+    playWiFiConnectedTune();
+    Serial.print("WiFi connected. IP: "); Serial.println(WiFi.localIP());
+  } else if (hasSaved && connectWiFi(defaultSsid, defaultPass, 1)) {
+    copyCredentials(defaultSsid, defaultPass);
+    setLed(false, true, false);
+    playWiFiConnectedTune();
+    Serial.print("Connected with default WiFi. IP: "); Serial.println(WiFi.localIP());
+  } else {
+    enterWifiSetupMode();
   }
-  // Connected - turn green LED on and keep it on
-  digitalWrite(redPin, LOW);
-  digitalWrite(greenPin, HIGH);
-  Serial.print("IP: "); Serial.println(WiFi.localIP());
-  
-  // Super Mario Bros - Intro (WiFi Connected Style 🎮)
-
-  tone(buzzerPin, 659, 150); delay(180);  // E5
-  tone(buzzerPin, 659, 150); delay(180);  // E5
-  delay(150);
-
-  tone(buzzerPin, 659, 150); delay(180);  // E5
-  delay(150);
-
-  tone(buzzerPin, 523, 150); delay(180);  // C5
-  tone(buzzerPin, 659, 150); delay(180);  // E5
-  tone(buzzerPin, 784, 300); delay(350);  // G5
-  delay(200);
-
-  tone(buzzerPin, 392, 300); delay(350);  // G4
   
   lastScan = millis();
   printList();
@@ -158,53 +282,70 @@ void setup() {
 
 void loop() {
   Usb.Task();
-  
+
   // Periodic WiFi check every 30 seconds
   static unsigned long lastWifiCheck = 0;
-  if (millis() - lastWifiCheck > 30000) {
+  if (!wifiSetupMode && millis() - lastWifiCheck > 30000) {
     lastWifiCheck = millis();
     if (WiFi.status() != WL_CONNECTED) {
-      Serial.println("WiFi disconnected, reconnecting...");
-      digitalWrite(greenPin, LOW);
-      digitalWrite(redPin, HIGH);
-      tone(buzzerPin, 500, 200);
-      WiFi.disconnect();
-      delay(100);
-      status = WL_IDLE_STATUS;
-      while (status != WL_CONNECTED) {
-        status = WiFi.begin(ssid, pass);
-        if (status != WL_CONNECTED) {
-          tone(buzzerPin, 500, 200);
-          delay(5000);
-        }
+      Serial.println("WiFi disconnected, attempting reconnect...");
+      if (connectWiFi(ssid, pass, 2)) {
+        setLed(false, true, false);
+        Serial.print("Reconnected IP: "); Serial.println(WiFi.localIP());
+      } else {
+        enterWifiSetupMode();
       }
-      digitalWrite(redPin, LOW);
-      digitalWrite(greenPin, HIGH);
-      Serial.print("Reconnected IP: "); Serial.println(WiFi.localIP());
     }
   }
-  
-  if (count > 0 && millis() - lastScan > TIMEOUT_MS) { beepError(); reset(); printList(); lastScan = millis(); }
+
   if (ready) {
-    process(barcode);
+    String scanned = barcode;
     barcode = "";
     ready = false;
+    scanned.trim();
+
+    if (scanned == "RESET_WIFI") {
+      clearSavedWiFi();
+      WiFi.disconnect();
+      enterWifiSetupMode();
+      Serial.println("Saved WiFi cleared");
+      lastScan = millis();
+      return;
+    }
+
+    if (wifiSetupMode) {
+      // In setup mode: first scan is SSID, second scan is password.
+      handleWifiProvisionScan(scanned);
+      lastScan = millis();
+      return;
+    }
+
+    process(scanned);
+    lastScan = millis();
+  }
+
+  if (count > 0 && millis() - lastScan > TIMEOUT_MS) {
+    beepError();
+    reset();
+    printList();
     lastScan = millis();
   }
 }
 
 void process(String b) {
-  b.trim(); b.toUpperCase();
+  String bUpper = b;
+  bUpper.trim();
+  bUpper.toUpperCase();
   beepScan();
-  Serial.print("> "); Serial.println(b);
-  
-  if (b == "SEND") {
+  Serial.print("> "); Serial.println(bUpper);
+
+  if (bUpper == "SEND") {
     // No blue light for SEND - handle separately
     if (count < 2) { Serial.println("Need 2+ barcodes"); beepError(); }
     else {
       int result = relocateWithStatus();
-      if (result == 1) { 
-        Serial.println("OK"); 
+      if (result == 1) {
+        Serial.println("OK");
         // Success - blink blue 3 times (longer duration)
         for (int i = 0; i < 3; i++) {
           digitalWrite(greenPin, LOW);
@@ -216,7 +357,7 @@ void process(String b) {
           delay(150);
           Usb.Task();
         }
-        reset(); 
+        reset();
       }
       else if (result == -1) {
         // Connection error - distinct feedback, keep barcodes for retry
@@ -224,29 +365,30 @@ void process(String b) {
         Serial.println("Connection failed - barcodes kept, try SEND again");
         // Don't reset - let user retry
       }
-      else { 
+      else {
         // Server rejected (result == 0)
-        Serial.println("FAILED - Server rejected"); 
-        beepError(); 
-        reset(); 
+        Serial.println("FAILED - Server rejected");
+        beepError();
+        reset();
       }
     }
     printList();
     return;
   }
-  
+
   // Blue light while processing regular barcodes
   digitalWrite(greenPin, LOW);
   digitalWrite(bluePin, HIGH);
-  
-  if (b == "UNDO") { if (count > 0) { popLastBarcode(); beepOK(); } }
-  else if (b == "RESET") { reset(); beepOK(); }
+
+  if (bUpper == "UNDO") { if (count > 0) { popLastBarcode(); beepOK(); } }
+  else if (bUpper == "RESET") { reset(); beepOK(); }
   else {
-    if (containsBarcode(b)) { Serial.println("Duplicate"); beepError(); printList(); digitalWrite(bluePin, LOW); digitalWrite(greenPin, HIGH); return; }
-    if (!appendBarcode(b)) { Serial.println("Out of memory"); beepError(); printList(); digitalWrite(bluePin, LOW); digitalWrite(greenPin, HIGH); return; }
+    if (containsBarcode(bUpper)) { Serial.println("Duplicate"); beepError(); printList(); digitalWrite(bluePin, LOW); digitalWrite(greenPin, HIGH); return; }
+    if (!appendBarcode(bUpper)) { Serial.println("Out of memory"); beepError(); printList(); digitalWrite(bluePin, LOW); digitalWrite(greenPin, HIGH); return; }
     Serial.println("Added");
     beepOK();
   }
+
   // Back to green after processing
   digitalWrite(bluePin, LOW);
   digitalWrite(greenPin, HIGH);
@@ -329,30 +471,11 @@ int httpRequestWithStatus(String method, String url, String body = "") {
   // Check WiFi and reconnect if needed
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println("WiFi lost, reconnecting...");
-    digitalWrite(greenPin, LOW);
-    digitalWrite(bluePin, LOW);
-    digitalWrite(redPin, HIGH);
-    tone(buzzerPin, 500, 200);
-    WiFi.disconnect();
-    delay(100);
-    status = WL_IDLE_STATUS;
-    int retryCount = 0;
-    while (status != WL_CONNECTED && retryCount < 3) {
-      Usb.Task(); // Keep USB alive
-      status = WiFi.begin(ssid, pass);
-      if (status != WL_CONNECTED) {
-        tone(buzzerPin, 500, 200);
-        retryCount++;
-        for (int i = 0; i < 50; i++) { delay(100); Usb.Task(); } // 5 sec with USB task
-      }
+    if (!connectWiFi(ssid, pass, 2)) {
+      enterWifiSetupMode();
+      return -1;
     }
-    if (status != WL_CONNECTED) {
-      digitalWrite(redPin, LOW);
-      digitalWrite(greenPin, HIGH);
-      return -1; // Connection error
-    }
-    digitalWrite(redPin, LOW);
-    digitalWrite(greenPin, HIGH);
+    setLed(false, true, false);
     Serial.print("Reconnected IP: "); Serial.println(WiFi.localIP());
   }
   
@@ -443,6 +566,8 @@ int httpRequestWithStatus(String method, String url, String body = "") {
 
 // Returns: 1 = success, 0 = server rejected, -1 = connection error
 int relocateWithStatus() {
+  if (count < 2 || !head || !tail) return 0;
+
   String json = "{\"AssetBarcodes\":[";
   BarcodeNode* current = head;
   while (current && current != tail) {
