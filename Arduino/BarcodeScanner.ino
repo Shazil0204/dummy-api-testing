@@ -16,6 +16,7 @@ const int serverPort = 443;
 const char* cfClientId = "fd0f2455c8ef15b1f83d6315190ee48b.access";
 const char* cfClientSecret = "7e4a0b4cefbd617e5b0a9be60444ea07eafcd7d6c2fe76cddf458ad5885bf7e4";
 const unsigned long TIMEOUT_MS = 60000;
+const unsigned long WIFI_CONNECT_TOTAL_TIMEOUT_MS = 12000;
 
 // EEPROM layout
 const uint16_t EEPROM_MAGIC = 0xBEEF;
@@ -43,7 +44,32 @@ unsigned long lastScan = 0;
 String barcode = "";
 bool ready = false;
 bool wifiSetupMode = false;
+bool scannerInputLocked = false;
+bool wifiConnectInProgress = false;
 String pendingWifiSsid = "";
+String pendingWifiPass = "";
+
+enum WiFiConnectState {
+  WIFI_IDLE,
+  WIFI_BEGIN,
+  WIFI_WAIT,
+  WIFI_SUCCESS,
+  WIFI_FAIL
+};
+
+enum WiFiConnectPurpose {
+  WIFI_PURPOSE_NONE,
+  WIFI_PURPOSE_BOOT_SAVED,
+  WIFI_PURPOSE_BOOT_DEFAULT,
+  WIFI_PURPOSE_PROVISION,
+  WIFI_PURPOSE_RECONNECT
+};
+
+WiFiConnectState wifiState = WIFI_IDLE;
+WiFiConnectPurpose wifiPurpose = WIFI_PURPOSE_NONE;
+unsigned long wifiStartMs = 0;
+String wifiSsidTmp = "";
+String wifiPassTmp = "";
 
 // USB
 USB Usb;
@@ -53,6 +79,8 @@ WiFiSSLClient client; // SSL client for HTTPS
 class KbdParser : public KeyboardReportParser {
 protected:
   void OnKeyDown(uint8_t mod, uint8_t key) override {
+    if (scannerInputLocked) return;
+
     uint8_t c = OemToAscii(mod, key);
     if (c) {
       if (c == 13 || c == 10) { if (barcode.length() > 0) ready = true; }
@@ -69,8 +97,12 @@ void initEepromStorage() {
 }
 
 void flushEepromStorage() {
+  // Arduino Uno R4 and other platforms: write to specific addresses to ensure flush
 #if defined(ARDUINO_ARCH_ESP32) || defined(ARDUINO_ARCH_ESP8266)
   EEPROM.commit();
+#else
+  // For non-ESP platforms, explicitly write a marker at a safe location
+  EEPROM.write(100, 0xAA);
 #endif
 }
 
@@ -80,27 +112,47 @@ void setLed(bool redOn, bool greenOn, bool blueOn) {
   digitalWrite(bluePin, blueOn ? HIGH : LOW);
 }
 
+void lockScannerInput() {
+  scannerInputLocked = true;
+  barcode = "";
+  ready = false;
+}
+
+void unlockScannerInput() {
+  barcode = "";
+  ready = false;
+  scannerInputLocked = false;
+}
+
+void delayWithUsb(unsigned long ms) {
+  unsigned long start = millis();
+  while (millis() - start < ms) {
+    Usb.Task();
+    delay(1);
+  }
+}
+
 void beepWifiAlert() {
-  tone(buzzerPin, 523, 150); delay(180);
-  tone(buzzerPin, 494, 150); delay(180);
-  tone(buzzerPin, 440, 250); delay(280);
+  tone(buzzerPin, 523, 150); delayWithUsb(180);
+  tone(buzzerPin, 494, 150); delayWithUsb(180);
+  tone(buzzerPin, 440, 250); delayWithUsb(280);
 }
 
 void playWiFiConnectedTune() {
   // Startup success tune kept from the original version.
-  tone(buzzerPin, 659, 150); delay(180);
-  tone(buzzerPin, 659, 150); delay(180);
-  delay(150);
+  tone(buzzerPin, 659, 150); delayWithUsb(180);
+  tone(buzzerPin, 659, 150); delayWithUsb(180);
+  delayWithUsb(150);
 
-  tone(buzzerPin, 659, 150); delay(180);
-  delay(150);
+  tone(buzzerPin, 659, 150); delayWithUsb(180);
+  delayWithUsb(150);
 
-  tone(buzzerPin, 523, 150); delay(180);
-  tone(buzzerPin, 659, 150); delay(180);
-  tone(buzzerPin, 784, 300); delay(350);
-  delay(200);
+  tone(buzzerPin, 523, 150); delayWithUsb(180);
+  tone(buzzerPin, 659, 150); delayWithUsb(180);
+  tone(buzzerPin, 784, 300); delayWithUsb(350);
+  delayWithUsb(200);
 
-  tone(buzzerPin, 392, 300); delay(350);
+  tone(buzzerPin, 392, 300); delayWithUsb(350);
 }
 
 void copyCredentials(const char* newSsid, const char* newPass) {
@@ -139,26 +191,73 @@ void clearSavedWiFi() {
   EEPROM.put(EEPROM_SSID_ADDR, ssid);
   EEPROM.put(EEPROM_PASS_ADDR, pass);
   flushEepromStorage();
+  // Additional safety: zero-fill the entire credential storage area
+  for (int i = EEPROM_SSID_ADDR; i < EEPROM_PASS_ADDR + 65; i++) {
+    EEPROM.write(i, 0);
+  }
+  flushEepromStorage();
+  delay(50); // Ensure EEPROM write completes
 }
 
-bool connectWiFi(const char* s, const char* p, int attempts) {
-  while (attempts-- > 0) {
-    status = WiFi.begin(s, p);
-    unsigned long start = millis();
-    while (millis() - start < 12000) {
-      Usb.Task();
-      if (WiFi.status() == WL_CONNECTED) return true;
-      delay(100);
-    }
-    WiFi.disconnect();
-    delay(100);
+void startWiFiConnect(const char* s, const char* p, WiFiConnectPurpose purpose) {
+  if (wifiConnectInProgress) return;
+
+  Serial.println("[WiFi] connect started");
+  wifiSsidTmp = s;
+  wifiPassTmp = p;
+  wifiPurpose = purpose;
+  wifiStartMs = millis();
+  wifiState = WIFI_BEGIN;
+  wifiConnectInProgress = true;
+  lockScannerInput();
+}
+
+void handleWiFiConnect() {
+  if (wifiState == WIFI_IDLE) return;
+
+  switch (wifiState) {
+    case WIFI_BEGIN:
+      WiFi.disconnect();
+      status = WiFi.begin(wifiSsidTmp.c_str(), wifiPassTmp.c_str());
+      wifiState = WIFI_WAIT;
+      break;
+
+    case WIFI_WAIT:
+      if (WiFi.status() == WL_CONNECTED) {
+        wifiState = WIFI_SUCCESS;
+      } else if (millis() - wifiStartMs > WIFI_CONNECT_TOTAL_TIMEOUT_MS) {
+        wifiState = WIFI_FAIL;
+      }
+      break;
+
+    case WIFI_SUCCESS:
+      Serial.println("[WiFi] connected");
+      Serial.print("IP: "); Serial.println(WiFi.localIP());
+      wifiState = WIFI_IDLE;
+      wifiConnectInProgress = false;
+      unlockScannerInput();
+      Serial.println("[WiFi] finalize (unlock scanner)");
+      break;
+
+    case WIFI_FAIL:
+      Serial.print("[WiFi] timeout/fail after ms: ");
+      Serial.println(millis() - wifiStartMs);
+      WiFi.disconnect();
+      wifiState = WIFI_IDLE;
+      wifiConnectInProgress = false;
+      unlockScannerInput();
+      Serial.println("[WiFi] finalize (unlock scanner)");
+      break;
+
+    default:
+      break;
   }
-  return false;
 }
 
 void enterWifiSetupMode() {
   wifiSetupMode = true;
   pendingWifiSsid = "";
+  pendingWifiPass = "";
   setLed(true, false, false);
   beepWifiAlert();
   Serial.println("WiFi missing/unconnectable. Scan SSID, then password.");
@@ -166,35 +265,32 @@ void enterWifiSetupMode() {
 
 void flashBlueForSsidScanned() {
   setLed(false, false, true);
-  delay(180);
+  delayWithUsb(180);
   setLed(true, false, false);
 }
 
 void handleWifiProvisionScan(const String& rawScan) {
+  String scan = rawScan;
+  scan.trim();
+
+  String upper = scan;
+  upper.toUpperCase();
+  if (upper == "SEND" || upper == "UNDO" || upper == "RESET") {
+    Serial.println("Ignored command barcode during WiFi setup mode.");
+    return;
+  }
+
   if (pendingWifiSsid.length() == 0) {
-    pendingWifiSsid = rawScan;
+    pendingWifiSsid = scan;
     Serial.print("SSID scanned: "); Serial.println(pendingWifiSsid);
     flashBlueForSsidScanned();
     return;
   }
 
-  String pendingWifiPass = rawScan;
   setLed(false, false, true); // steady blue while connecting
   Serial.print("Connecting using SSID: "); Serial.println(pendingWifiSsid);
-
-  if (connectWiFi(pendingWifiSsid.c_str(), pendingWifiPass.c_str(), 2)) {
-    saveWiFi(pendingWifiSsid.c_str(), pendingWifiPass.c_str());
-    wifiSetupMode = false;
-    pendingWifiSsid = "";
-    setLed(false, true, false);
-    playWiFiConnectedTune();
-    Serial.print("WiFi connected and saved. IP: "); Serial.println(WiFi.localIP());
-  } else {
-    pendingWifiSsid = "";
-    setLed(true, false, false);
-    beepWifiAlert();
-    Serial.println("WiFi connect failed. Credentials not saved.");
-  }
+  pendingWifiPass = scan;
+  startWiFiConnect(pendingWifiSsid.c_str(), pendingWifiPass.c_str(), WIFI_PURPOSE_PROVISION);
 }
 
 bool containsBarcode(const String& value) {
@@ -259,21 +355,13 @@ void setup() {
   initEepromStorage();
 
   bool hasSaved = loadSavedWiFi();
-  if (!hasSaved) copyCredentials(defaultSsid, defaultPass);
-
   Serial.println("Trying saved/default WiFi...");
   setLed(true, false, false);
-  if (connectWiFi(ssid, pass, 2)) {
-    setLed(false, true, false);
-    playWiFiConnectedTune();
-    Serial.print("WiFi connected. IP: "); Serial.println(WiFi.localIP());
-  } else if (hasSaved && connectWiFi(defaultSsid, defaultPass, 1)) {
-    copyCredentials(defaultSsid, defaultPass);
-    setLed(false, true, false);
-    playWiFiConnectedTune();
-    Serial.print("Connected with default WiFi. IP: "); Serial.println(WiFi.localIP());
+  if (hasSaved) {
+    startWiFiConnect(ssid, pass, WIFI_PURPOSE_BOOT_SAVED);
   } else {
-    enterWifiSetupMode();
+    copyCredentials(defaultSsid, defaultPass);
+    startWiFiConnect(defaultSsid, defaultPass, WIFI_PURPOSE_BOOT_DEFAULT);
   }
   
   lastScan = millis();
@@ -282,19 +370,74 @@ void setup() {
 
 void loop() {
   Usb.Task();
+  handleWiFiConnect();
 
-  // Periodic WiFi check every 30 seconds
-  static unsigned long lastWifiCheck = 0;
-  if (!wifiSetupMode && millis() - lastWifiCheck > 30000) {
-    lastWifiCheck = millis();
-    if (WiFi.status() != WL_CONNECTED) {
-      Serial.println("WiFi disconnected, attempting reconnect...");
-      if (connectWiFi(ssid, pass, 2)) {
+  // Safety: never leave scanner locked once connect attempt is done.
+  if (!wifiConnectInProgress && scannerInputLocked) {
+    unlockScannerInput();
+    // Force clear any buffered input after WiFi operations
+    barcode = "";
+    ready = false;
+  }
+
+  // Handle completed WiFi attempts by purpose.
+  static bool lastConnectInProgress = false;
+  if (lastConnectInProgress && !wifiConnectInProgress && wifiState == WIFI_IDLE) {
+    bool connected = (WiFi.status() == WL_CONNECTED);
+    WiFiConnectPurpose finishedPurpose = wifiPurpose;
+    wifiPurpose = WIFI_PURPOSE_NONE;
+
+    if (finishedPurpose == WIFI_PURPOSE_BOOT_SAVED) {
+      if (connected) {
+        setLed(false, true, false);
+        playWiFiConnectedTune();
+        Serial.print("WiFi connected. IP: "); Serial.println(WiFi.localIP());
+      } else {
+        copyCredentials(defaultSsid, defaultPass);
+        startWiFiConnect(defaultSsid, defaultPass, WIFI_PURPOSE_BOOT_DEFAULT);
+      }
+    } else if (finishedPurpose == WIFI_PURPOSE_BOOT_DEFAULT) {
+      if (connected) {
+        setLed(false, true, false);
+        playWiFiConnectedTune();
+        Serial.print("Connected with default WiFi. IP: "); Serial.println(WiFi.localIP());
+      } else {
+        enterWifiSetupMode();
+      }
+    } else if (finishedPurpose == WIFI_PURPOSE_PROVISION) {
+      if (connected) {
+        saveWiFi(pendingWifiSsid.c_str(), pendingWifiPass.c_str());
+        wifiSetupMode = false;
+        pendingWifiSsid = "";
+        pendingWifiPass = "";
+        setLed(false, true, false);
+        playWiFiConnectedTune();
+        Serial.println("WiFi connected and saved.");
+      } else {
+        pendingWifiSsid = "";
+        pendingWifiPass = "";
+        setLed(true, false, false);
+        beepWifiAlert();
+        Serial.println("WiFi connect failed. Credentials not saved.");
+      }
+    } else if (finishedPurpose == WIFI_PURPOSE_RECONNECT) {
+      if (connected) {
         setLed(false, true, false);
         Serial.print("Reconnected IP: "); Serial.println(WiFi.localIP());
       } else {
         enterWifiSetupMode();
       }
+    }
+  }
+  lastConnectInProgress = wifiConnectInProgress;
+
+  // Periodic WiFi check every 30 seconds
+  static unsigned long lastWifiCheck = 0;
+  if (!wifiSetupMode && !wifiConnectInProgress && millis() - lastWifiCheck > 30000) {
+    lastWifiCheck = millis();
+    if (WiFi.status() != WL_CONNECTED) {
+      Serial.println("WiFi disconnected, attempting reconnect...");
+      startWiFiConnect(ssid, pass, WIFI_PURPOSE_RECONNECT);
     }
   }
 
@@ -471,12 +614,10 @@ int httpRequestWithStatus(String method, String url, String body = "") {
   // Check WiFi and reconnect if needed
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println("WiFi lost, reconnecting...");
-    if (!connectWiFi(ssid, pass, 2)) {
-      enterWifiSetupMode();
-      return -1;
+    if (!wifiConnectInProgress) {
+      startWiFiConnect(ssid, pass, WIFI_PURPOSE_RECONNECT);
     }
-    setLed(false, true, false);
-    Serial.print("Reconnected IP: "); Serial.println(WiFi.localIP());
+    return -1;
   }
   
   // Make sure previous connection is closed
